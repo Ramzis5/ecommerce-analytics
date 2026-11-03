@@ -9,7 +9,7 @@ A full-stack analytics platform for an online fashion shop — built with **Stre
 
 ## 🚀 Live Demo
 
-👉 **[Live Demo](https://ecommerce-analytics-qbvfseaafrhic62pjkdqox.streamlit.app)** — Login: `admin` / `admin123`
+👉 **[Live Demo](https://ecommerce-analytics-dtzoxjkhruuuufxvn6rvrb.streamlit.app/)** — Login: `admin` / `admin123`
 
 ---
 
