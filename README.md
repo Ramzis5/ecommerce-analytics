@@ -143,6 +143,8 @@ Data source: **TheLook E-Commerce** dataset (100K+ records)
 
 <img width="1366" height="3246" alt="screencapture-ecommerce-analytics-7" src="https://github.com/user-attachments/assets/1d8c4fb7-705b-420e-9eff-94f1aab63a56" />
 <img width="1366" height="599" alt="screencapture_1793978462137" src="https://github.com/user-attachments/assets/cd02efbe-5ff9-4bfc-9b9b-ea5c040e74c9" />
+<img width="1365" height="588" alt="screencapture_1793978766394" src="https://github.com/user-attachments/assets/ac374fc4-4f16-4619-bc77-9fc7d6ff7177" />
+<img width="1364" height="591" alt="screencapture_1793978889543" src="https://github.com/user-attachments/assets/db503b07-8554-4a6f-b741-3e379925134e" />
 
 ---
 
