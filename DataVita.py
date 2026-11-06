@@ -1,3 +1,7 @@
+from runtime_diagnostics import enable_fault_logging, log_memory
+
+enable_fault_logging()
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,7 +10,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
-from io import BytesIO
 
 # ── ML Imports (einmalig beim Start, nicht bei jedem Seitenwechsel) ──
 try:
@@ -1148,13 +1151,10 @@ def order_funnel(df_status):
     fig = px.funnel(df, x="count", y="status", color_discrete_sequence=[C["violet"]])
     return plotly_dark(fig, 300)
 
-def event_funnel(df_events):
+def event_funnel(funnel_counts):
     order = ["home", "department", "product", "cart", "purchase"]
-    stage_map = {s: i for i, s in enumerate(order)}
-    df = df_events.copy()
-    df["event_type"] = df["event_type"].str.lower()
-    # Einfache Zählung: Unique Sessions pro Event-Typ
-    counts = df.groupby("event_type")["session_id"].nunique().reset_index(name="events")
+    # Die Datenbank liefert bereits Unique Sessions pro normalisiertem Event-Typ.
+    counts = funnel_counts.copy()
     # Nur gültige Stufen behalten und sortieren
     counts = counts[counts["event_type"].isin(order)]
     counts["event_type"] = pd.Categorical(counts["event_type"], categories=order, ordered=True)
@@ -1196,8 +1196,9 @@ if "project_selected" not in st.session_state:
 # ╔═══════════════════════════════════════════════════════════╗
 #  DATA LOAD 
 # ╚═══════════════════════════════════════════════════════════╝
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, max_entries=1, show_spinner=False)
 def load_data():
+    log_memory("data_load_start")
     engine = get_engine()
 
     sales = pd.read_sql("""
@@ -1215,12 +1216,6 @@ def load_data():
         LEFT JOIN users u ON oi.user_id = u.id
     """, engine)
 
-    events = pd.read_sql("""
-        SELECT user_id, session_id, created_at, event_type,
-               city, state, postal_code, browser, traffic_source
-        FROM events
-    """, engine)
-
     distribution_centers = pd.read_sql("""
         SELECT id, name, latitude, longitude
         FROM distribution_centers
@@ -1235,7 +1230,6 @@ def load_data():
     
     for col in ["created_at", "shipped_at", "delivered_at", "returned_at"]:
         sales[col] = pd.to_datetime(sales[col], errors="coerce")
-    events["created_at"] = pd.to_datetime(events["created_at"], errors="coerce")
     sales["profit"] = sales["sale_price"] - sales["product_cost"]
     _status = sales["status"].astype(str).str.lower()
     sales["is_returned"] = (_status == "returned").astype(int)
@@ -1245,16 +1239,25 @@ def load_data():
    
     sales["_year"] = sales["created_at"].dt.year
     sales["_is_cs"] = _status.isin(["complete", "shipped"]).to_numpy()
-    events["_year"] = events["created_at"].dt.year
-    return sales, events, distribution_centers, users_df
+    log_memory("data_load_end")
+    return sales, distribution_centers, users_df
+
+
+@st.cache_data(ttl=600, max_entries=16, show_spinner=False)
+def load_event_metrics(selected_years=()):
+    """Load only small aggregates, and only when the customer page needs them."""
+    from data_runtime import fetch_event_metrics
+
+    return fetch_event_metrics(get_engine(), selected_years)
 
 if st.session_state.logged_in and st.session_state.project_selected:
+    # Release raw events retained by sessions opened before this optimization.
+    st.session_state.pop("events", None)
     if ("sales" not in st.session_state or "filter_opts" not in st.session_state
             or "_year" not in st.session_state.sales.columns):
         with st.spinner("⏳ Daten werden geladen..."):
-            _s, _e, _d, _u = load_data()
+            _s, _d, _u = load_data()
             st.session_state.sales = _s
-            st.session_state.events = _e
             st.session_state.dist_centers = _d
             st.session_state.users = _u
            
@@ -1269,7 +1272,6 @@ if st.session_state.logged_in and st.session_state.project_selected:
             }
 
     sales = st.session_state.sales
-    events = st.session_state.events
     dist_centers = st.session_state.dist_centers
     users = st.session_state.users
 
@@ -1369,7 +1371,7 @@ if st.session_state.logged_in and st.session_state.project_selected:
 
     #  Reset Button
     st.sidebar.markdown('<div class="sb-line"></div>', unsafe_allow_html=True)
-    if st.sidebar.button("🔄  Reset Dashboard", use_container_width=True, type="secondary"):
+    if st.sidebar.button("🔄  Reset Dashboard", width="stretch", type="secondary"):
         st.cache_data.clear()
         for key in list(st.session_state.keys()):
             del st.session_state[key]
@@ -1386,13 +1388,8 @@ if st.session_state.logged_in and st.session_state.project_selected:
     if selected_status:      fs = fs[fs["status"].isin(selected_status)]
 
     uids = fs["user_id"].dropna().unique()
-    fe = events[events["user_id"].isin(uids)]
     fu = users[users["id"].isin(uids)]
     cs = fs[fs["_is_cs"]]
-
-    fe_all = events
-    if selected_years:
-        fe_all = fe_all[fe_all["_year"].isin(selected_years)]
 
     annual_fs = sales
     if selected_countries:   annual_fs = annual_fs[annual_fs["country"].isin(selected_countries)]
@@ -1413,7 +1410,7 @@ if st.session_state.logged_in and st.session_state.project_selected:
     margin       = gross_profit / tot_sales * 100 if tot_sales else 0
 
     yearly = (
-        annual_cs.dropna(subset=["created_at"])
+        annual_cs[["created_at", "sale_price"]].dropna(subset=["created_at"])
         .assign(Year=lambda d: d["created_at"].dt.year.astype(int))
         .groupby("Year", as_index=False)["sale_price"].sum()
         .rename(columns={"sale_price": "Sales"})
@@ -1422,7 +1419,7 @@ if st.session_state.logged_in and st.session_state.project_selected:
     yearly["YoY"] = yearly["Sales"].pct_change() * 100
 
     monthly = (
-        cs.dropna(subset=["created_at"])
+        cs[["created_at", "sale_price"]].dropna(subset=["created_at"])
         .assign(MonthDate=lambda d: d["created_at"].dt.to_period("M").dt.to_timestamp())
         .groupby("MonthDate", as_index=False)["sale_price"].sum()
         .rename(columns={"sale_price": "Sales"})
@@ -1432,7 +1429,7 @@ if st.session_state.logged_in and st.session_state.project_selected:
     monthly["MoM"] = monthly["Sales"].pct_change() * 100
 
     monthly_agg = (
-        cs.dropna(subset=["created_at"])
+        cs[["created_at", "sale_price"]].dropna(subset=["created_at"])
         .assign(MonthNum=lambda d: d["created_at"].dt.month)
         .groupby("MonthNum", as_index=False)["sale_price"].sum()
         .rename(columns={"sale_price": "Sales"})
@@ -1498,8 +1495,12 @@ def render_header(key, analysis=True):
 # ╔═══════════════════════════════════════════════════════════╗
 #  CACHED ML FUNCTIONS 
 # ╚═══════════════════════════════════════════════════════════╝
-@st.cache_data(ttl=600, show_spinner=False)
-def build_churn_dataset(_sales, _users):
+from ml_reliability import (churn_training_error, fingerprint_frames,
+                            forecast_max_horizon)
+
+
+@st.cache_data(ttl=600, max_entries=1, show_spinner=False)
+def build_churn_dataset(data_key, _sales, _users):
     """Churn-Datensatz einmalig bauen und cachen."""
     all_s = _sales.copy()
     ref = all_s["created_at"].max()
@@ -1528,10 +1529,13 @@ def build_churn_dataset(_sales, _users):
     return cdf
 
 
-@st.cache_resource(show_spinner=False)
-def train_churn_models(_X_hash, _X_vals, _y_vals, _features):
+@st.cache_resource(ttl=3600, max_entries=1, show_spinner=False)
+def train_churn_models(data_key, _X_vals, _y_vals, _features):
     X_df = pd.DataFrame(_X_vals, columns=_features)
     y_s = pd.Series(_y_vals)
+    training_error = churn_training_error(y_s)
+    if training_error:
+        raise ValueError(training_error)
     sc = StandardScaler()
     X_sc = pd.DataFrame(sc.fit_transform(X_df), columns=_features)
     X_tr, X_te, y_tr, y_te = train_test_split(X_sc, y_s, test_size=0.25, random_state=42, stratify=y_s)
@@ -1543,7 +1547,7 @@ def train_churn_models(_X_hash, _X_vals, _y_vals, _features):
     trained = {
         "Random Forest": RandomForestClassifier(
             n_estimators=300, max_depth=12, min_samples_leaf=4,
-            min_samples_split=2, class_weight=cw, random_state=42, n_jobs=-1).fit(X_tr, y_tr),
+            min_samples_split=2, class_weight=cw, random_state=42, n_jobs=1).fit(X_tr, y_tr),
         "Gradient Boosting": GradientBoostingClassifier(
             n_estimators=250, max_depth=5, learning_rate=0.08,
             min_samples_leaf=5, subsample=0.85, random_state=42).fit(X_tr, y_tr, sample_weight=sw_tr),
@@ -1584,7 +1588,7 @@ def train_churn_models(_X_hash, _X_vals, _y_vals, _features):
 
     best_n = "Random Forest"
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_sc = cross_val_score(trained[best_n], X_sc, y_s, cv=cv, scoring="f1")
+    cv_sc = cross_val_score(trained[best_n], X_sc, y_s, cv=cv, scoring="f1", n_jobs=1)
 
     bm = trained[best_n]
     if hasattr(bm, "feature_importances_"):
@@ -2341,7 +2345,7 @@ def page_overview():
             fig = plotly_dark(fig, 280, showlegend=False)
             fig.update_xaxes(title_text="Jahr", tickmode="linear", dtick=1)
             fig.update_yaxes(title_text="Sales ($)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("Keine Jahresdaten verfügbar.")
 
@@ -2364,7 +2368,7 @@ def page_overview():
             orientation="h", color_discrete_sequence=[C["violet"]],
         )
         fig.update_traces(marker=dict(cornerradius=5))
-        st.plotly_chart(plotly_dark(fig, 340, showlegend=False), use_container_width=True)
+        st.plotly_chart(plotly_dark(fig, 340, showlegend=False), width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
     spacer()
@@ -2385,7 +2389,7 @@ def page_overview():
                          categoryarray=["Jan","Feb","Mär","Apr","Mai","Jun",
                                         "Jul","Aug","Sep","Okt","Nov","Dez"])
         fig.update_yaxes(title_text="Sales ($)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("Keine Monatsdaten verfügbar.")
 
@@ -2420,7 +2424,7 @@ def page_overview():
                 showlakes=False, framecolor="rgba(0,0,0,0)",
                 coastlinecolor="#334155",
             )
-            st.plotly_chart(plotly_dark(fig, 340), use_container_width=True)
+            st.plotly_chart(plotly_dark(fig, 340), width="stretch")
         else:
             st.info("Keine Geodaten verfügbar.")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2431,7 +2435,7 @@ def page_overview():
         show_monthly = monthly[["Month", "Sales", "MoM"]].copy()
         show_monthly["Sales"] = show_monthly["Sales"].map(lambda x: f"{x:,.0f} $")
         show_monthly["MoM"] = show_monthly["MoM"].map(lambda x: f"{x:+.1f}%" if not pd.isna(x) else "—")
-        st.dataframe(show_monthly, use_container_width=True, hide_index=True, height=340)
+        st.dataframe(show_monthly, width="stretch", hide_index=True, height=340)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -2467,7 +2471,7 @@ def page_returns():
         fig = px.bar(rc.sort_values("rr"), x="rr", y="category", orientation="h",
                      color_discrete_sequence=[C["violet"]])
         fig.update_traces(marker=dict(cornerradius=5))
-        st.plotly_chart(plotly_dark(fig, 340, showlegend=False), use_container_width=True)
+        st.plotly_chart(plotly_dark(fig, 340, showlegend=False), width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
@@ -2479,7 +2483,7 @@ def page_returns():
         fig = px.bar(rb.sort_values("rr"), x="rr", y="brand", orientation="h",
                      color_discrete_sequence=[C["pink"]])
         fig.update_traces(marker=dict(cornerradius=5))
-        st.plotly_chart(plotly_dark(fig, 340, showlegend=False), use_container_width=True)
+        st.plotly_chart(plotly_dark(fig, 340, showlegend=False), width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
     spacer()
@@ -2496,7 +2500,7 @@ def page_returns():
         ps["rr"] = ps["returned"] / ps["total"] * 100
         fig = px.scatter(ps, x="retail_price", y="rr", size="sales",
                          hover_name="product_name", color_discrete_sequence=[C["cyan"]])
-        st.plotly_chart(plotly_dark(fig, 320), use_container_width=True)
+        st.plotly_chart(plotly_dark(fig, 320), width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right2:
@@ -2504,7 +2508,7 @@ def page_returns():
         sec("Bestellstatus Funnel", C["violet"])
         sd = fs.groupby("status").size().reset_index(name="count")
         fig = order_funnel(sd)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -2514,17 +2518,26 @@ def page_returns():
 def page_customers():
     render_header("3. Customer & Conversion")
 
+    try:
+        with st.spinner("⏳ Ereignis-Kennzahlen werden geladen..."):
+            funnel_counts, ev, sc = load_event_metrics(
+                tuple(sorted(int(year) for year in selected_years))
+            )
+    except Exception as exc:
+        # Do not display database exceptions, which may include connection details.
+        print(f"[runtime] event_metrics_failed:{type(exc).__name__}", flush=True)
+        st.error("Die Ereignis-Kennzahlen konnten nicht geladen werden. Bitte später erneut versuchen.")
+        return
+
     #  ROW 1: Funnel + Traffic + Age 
     c1, c2, c3 = st.columns(3)
 
     with c1:
         st.markdown('<div class="glass">', unsafe_allow_html=True)
         sec("Conversion Funnel", C["emerald"])
-        fig, _ = event_funnel(fe_all)
-        st.plotly_chart(fig, use_container_width=True)
-        ev = fe_all.groupby("event_type").size().reset_index(name="events")
+        fig, _ = event_funnel(funnel_counts)
+        st.plotly_chart(fig, width="stretch")
         pc = ev.loc[ev["event_type"].str.lower() == "purchase", "events"].sum()
-        sc = fe_all["session_id"].nunique() if "session_id" in fe_all.columns else len(fe_all)
         conv = (pc / sc * 100) if sc else 0
         mini("Conversion Rate", pct(conv), C["emerald"])
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2536,7 +2549,7 @@ def page_customers():
         if len(tf):
             fig = px.pie(tf, names="traffic_source", values="users", hole=0.65,
                          color_discrete_sequence=CHART_SEQ)
-            st.plotly_chart(plotly_dark(fig, 360), use_container_width=True)
+            st.plotly_chart(plotly_dark(fig, 360), width="stretch")
         else:
             st.info("Keine Daten.")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2548,7 +2561,7 @@ def page_customers():
         adf["ag"] = pd.cut(adf["age"], bins=[0,20,30,40,50,120], labels=["<20","20–29","30–39","40–49","50+"], right=False)
         aa = adf.groupby("ag", observed=False).size().reset_index(name="users")
         fig = px.pie(aa, names="ag", values="users", hole=0.65, color_discrete_sequence=CHART_SEQ)
-        st.plotly_chart(plotly_dark(fig, 360), use_container_width=True)
+        st.plotly_chart(plotly_dark(fig, 360), width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
     spacer()
@@ -2574,7 +2587,7 @@ def page_customers():
         texttemplate="%{text:,.0f} $", textposition="outside",
         marker=dict(cornerradius=5),
     )
-    st.plotly_chart(plotly_dark(fig, 350, showlegend=False), use_container_width=True)
+    st.plotly_chart(plotly_dark(fig, 350, showlegend=False), width="stretch")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -2592,7 +2605,7 @@ def page_products():
         tree = cs.groupby(["department", "category"], as_index=False)["sale_price"].sum().rename(columns={"sale_price": "Sales"})
         fig = px.treemap(tree, path=["department", "category"], values="Sales",
                          color="Sales", color_continuous_scale="Purp")
-        st.plotly_chart(plotly_dark(fig, 380), use_container_width=True)
+        st.plotly_chart(plotly_dark(fig, 380), width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
@@ -2602,7 +2615,7 @@ def page_products():
         cm["m"] = cm["p"] / cm["s"] * 100
         avg_m = cm["m"].mean() if len(cm) else 0
         fig = gauge(avg_m, "Margin %")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         # Extra stats
         spacer()
@@ -2626,7 +2639,7 @@ def page_products():
             fig = px.bar(dc.sort_values("Sales"), x="Sales", y="name", orientation="h",
                          color_discrete_sequence=[C["amber"]])
             fig.update_traces(marker=dict(cornerradius=5))
-            st.plotly_chart(plotly_dark(fig, 340, showlegend=False), use_container_width=True)
+            st.plotly_chart(plotly_dark(fig, 340, showlegend=False), width="stretch")
         else:
             st.info("Keine Daten.")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2638,7 +2651,7 @@ def page_products():
         fig = px.bar(pt.sort_values("sale_price"), x="sale_price", y="product_name",
                      orientation="h", color_discrete_sequence=[C["blue"]])
         fig.update_traces(marker=dict(cornerradius=5))
-        st.plotly_chart(plotly_dark(fig, 340, showlegend=False), use_container_width=True)
+        st.plotly_chart(plotly_dark(fig, 340, showlegend=False), width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -2709,7 +2722,7 @@ def page_advanced():
             height=385  # Etwas höher für besseres Alignment
         )
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
@@ -2760,7 +2773,7 @@ def page_advanced():
             )
             fig.update_layout(coloraxis_colorbar=dict(title="Marge %", thickness=10))
             
-            st.plotly_chart(plotly_dark(fig, 290), use_container_width=True)
+            st.plotly_chart(plotly_dark(fig, 290), width="stretch")
         else:
             st.info("⚠️ Keine Daten gefunden, die diesen Kriterien entsprechen (z.B. zu hoher Filter).")
 
@@ -2787,7 +2800,7 @@ def page_advanced():
 
         fig = px.area(mr, x="Month", y="Customers", color_discrete_sequence=[C["emerald"]])
         fig.update_traces(fill="tozeroy", fillcolor="rgba(16,185,129,0.08)", line=dict(width=2.5))
-        st.plotly_chart(plotly_dark(fig, 260, showlegend=False), use_container_width=True)
+        st.plotly_chart(plotly_dark(fig, 260, showlegend=False), width="stretch")
         mini("Repeat Customer Rate", pct(rr), C["emerald"])
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2901,7 +2914,7 @@ def page_kundensegmentierung():
         sg["Segment"] = pd.Categorical(sg["Segment"], categories=_seg_order, ordered=True)
         sg = sg.sort_values("Segment")
         fig = px.pie(sg, names="Segment", values="Kunden", hole=0.65, color_discrete_sequence=CHART_SEQ)
-        st.plotly_chart(plotly_dark(fig, 360), use_container_width=True)
+        st.plotly_chart(plotly_dark(fig, 360), width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right_c:
@@ -2912,7 +2925,7 @@ def page_kundensegmentierung():
                          color_discrete_sequence=CHART_SEQ)
         fig.update_xaxes(autorange="reversed", title_text="Recency (Tage — niedrig = besser)")
         fig.update_yaxes(title_text="Monetary ($)")
-        st.plotly_chart(plotly_dark(fig, 380), use_container_width=True)
+        st.plotly_chart(plotly_dark(fig, 380), width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
     spacer()
@@ -2944,7 +2957,7 @@ def page_kundensegmentierung():
     show_seg["Ø_Monetary"] = show_seg["Ø_Monetary"].map(lambda x: human_money(x))
     show_seg["Umsatz_Anteil"] = show_seg["Umsatz_Anteil"].map(lambda x: f"{x:.1f} %")
     show_seg.columns = ["Segment", "Kunden", "Ø Recency", "Ø Frequency", "Ø Monetary", "Umsatz %", "Marketing-Empfehlung"]
-    st.dataframe(show_seg, use_container_width=True, hide_index=True)
+    st.dataframe(show_seg, width="stretch", hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     spacer()
@@ -2960,7 +2973,7 @@ def page_kundensegmentierung():
     preview = seg_cust[["Kunde", "recency", "frequency", "monetary", "RFM_Score", "city", "country"]].head(15).copy()
     preview.columns = ["Kunde", "Recency", "Orders", "Umsatz ($)", "RFM", "Stadt", "Land"]
     preview["Umsatz ($)"] = seg_cust["monetary"].head(15).map(lambda x: f"{x:,.2f} $")
-    st.dataframe(preview, use_container_width=True, hide_index=True)
+    st.dataframe(preview, width="stretch", hide_index=True)
     spacer()
     m1, m2 = st.columns(2)
     with m1: mini("Kunden im Segment", human_number(len(seg_cust)), C["violet"])
@@ -2968,7 +2981,7 @@ def page_kundensegmentierung():
     spacer()
     csv_d = seg_cust[["user_id", "Kunde", "recency", "frequency", "monetary", "RFM_Score", "Segment", "city", "country"]].to_csv(index=False).encode("utf-8")
     st.download_button(f"📥 {sel_seg} als CSV ({len(seg_cust)} Kunden)", csv_d,
-                       f"rfm_{sel_seg.lower().replace(' ', '_')}.csv", "text/csv", use_container_width=True)
+                       f"rfm_{sel_seg.lower().replace(' ', '_')}.csv", "text/csv", width="stretch")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -3710,9 +3723,12 @@ def page_forecast_prediction():
         sec("Einstellungen", C["amber"])
         set_c1, set_c2, set_c3 = st.columns(3)
         with set_c1:
-            forecast_horizon = st.slider("🔮 Vorhersage- & Test-Horizont", min_value=1, max_value=12, value=4)
+            max_horizon = forecast_max_horizon(len(_monthly_fc))
+            forecast_horizon = st.slider(
+                "🔮 Vorhersage- & Test-Horizont", min_value=1,
+                max_value=max_horizon, value=min(4, max_horizon))
         with set_c2:
-            train_lookback = st.slider("📅 Trend-Gedächtnis (Monate)", min_value=6, max_value=len(_monthly_fc), value=24)
+            train_lookback = st.slider("📅 Trend-Gedächtnis (Monate)", min_value=6, max_value=len(_monthly_fc), value=min(24, len(_monthly_fc)))
         with set_c3:
             ma_window = st.slider("📊 Moving Avg Fenster", min_value=2, max_value=12, value=3)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -3747,6 +3763,10 @@ def page_forecast_prediction():
         lookback = min(train_lookback, len(_X_train_full))
         _X_train_recent = _X_train_full[-lookback:]
         _y_train_log_recent = _y_train_log_full[-lookback:]
+
+        if len(_X_train_recent) == 0:
+            st.warning("Nicht genügend Trainingsmonate für den gewählten Prognosehorizont.")
+            return
 
         # 1. MODEL: Lineare Regression
         lr = LinearRegression()
@@ -3878,7 +3898,7 @@ def page_forecast_prediction():
             xanchor="center", x=0.5
         ))
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         st.markdown("</div>", unsafe_allow_html=True)
 
         spacer()
@@ -3900,7 +3920,7 @@ def page_forecast_prediction():
                 f"Moving Average ({ma_window}M Soll)": [human_money(v) for v in table_ma]
             })
 
-            st.dataframe(future_df, use_container_width=True, hide_index=True)
+            st.dataframe(future_df, width="stretch", hide_index=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
         with right_t:
@@ -3956,7 +3976,12 @@ def page_churn_prediction():
     </div>""", unsafe_allow_html=True)
     spacer()
 
-    churn_df = build_churn_dataset(sales, users)
+    source_key = fingerprint_frames(
+        sales[["user_id", "order_id", "sale_price", "created_at", "id",
+               "category", "brand", "profit", "is_returned"]],
+        users[["id", "age"]],
+    )
+    churn_df = build_churn_dataset(source_key, sales, users)
     CHURN_DAYS = 90
     features = ["total_orders", "total_spend", "avg_order_value", "avg_days_between",
                 "orders_per_month", "return_rate", "num_categories", "num_brands",
@@ -3964,11 +3989,13 @@ def page_churn_prediction():
     X = churn_df[features].fillna(0)
     y = churn_df["is_churned"]
 
-    if len(X) >= 50 and y.nunique() == 2:
-        data_hash = hash((len(X), int(y.sum()), round(X.values.sum(), 2)))
-        cache = train_churn_models(data_hash, X.values, y.values, features)
+    training_error = churn_training_error(y)
+    if training_error is None:
+        data_key = fingerprint_frames(X, y.to_frame())
+        cache = train_churn_models(data_key, X.values, y.values, features)
         scaler = cache["scaler"]
-        X_scaled = cache["X_scaled"]
+        # Transform the current rows: never attach predictions from an older snapshot.
+        X_scaled = pd.DataFrame(scaler.transform(X), columns=features)
         results = cache["results"]
         best_name = cache["best_name"]
         best_model = cache["best_model"]
@@ -4011,7 +4038,7 @@ def page_churn_prediction():
                               "FN": r["fn"], "FP": r["fp"], "Fehler": r["errors"]})
 
         df_comp = pd.DataFrame(comp_rows).sort_values("Fehler")
-        st.dataframe(df_comp, use_container_width=True, hide_index=True)
+        st.dataframe(df_comp, width="stretch", hide_index=True)
         st.markdown("</div>", unsafe_allow_html=True)
         spacer()
 
@@ -4031,7 +4058,7 @@ def page_churn_prediction():
                          color="Importance", color_continuous_scale=["#1e1b4b", C["violet"], C["cyan"]])
             fig.update_traces(marker=dict(cornerradius=4))
             fig.update_layout(coloraxis_showscale=False)
-            st.plotly_chart(plotly_dark(fig, 380, showlegend=False), use_container_width=True)
+            st.plotly_chart(plotly_dark(fig, 380, showlegend=False), width="stretch")
             st.markdown("</div>", unsafe_allow_html=True)
 
         with right_ch:
@@ -4047,7 +4074,7 @@ def page_churn_prediction():
                 color="S",
                 color_discrete_map={"Aktiv": "#0068C9", "Churned": "#83C9FF"}
             )
-            st.plotly_chart(plotly_dark(fig, 280), use_container_width=True)
+            st.plotly_chart(plotly_dark(fig, 280), width="stretch")
             mini("Churn Rate", pct(churn_rate), C["rose"])
             mini("Churn-Schwelle", f"{CHURN_DAYS} Tage", C["amber"])
             st.markdown("</div>", unsafe_allow_html=True)
@@ -4076,7 +4103,7 @@ def page_churn_prediction():
                                   yaxis=dict(showgrid=True, gridcolor="rgba(55,65,81,0.3)", zeroline=False))
             fig_roc.update_xaxes(title_text="FPR");
             fig_roc.update_yaxes(title_text="TPR")
-            st.plotly_chart(fig_roc, use_container_width=True)
+            st.plotly_chart(fig_roc, width="stretch")
             st.markdown("</div>", unsafe_allow_html=True)
 
         with right_roc:
@@ -4103,7 +4130,7 @@ def page_churn_prediction():
             fig = px.imshow(cm_df, text_auto=True, color_continuous_scale=["#0b0f19", C["cyan"]], aspect="auto")
             fig = plotly_dark(fig, 300, showlegend=False)
             fig.update_layout(coloraxis_showscale=False)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             st.markdown(f"""<div style="font-size:12px;color:{C['muted']};margin-top:4px;">
                 <strong style="color:{C['rose']};">FN={br['fn']}</strong> übersehen ·
                 <strong style="color:{C['amber']};">FP={br['fp']}</strong> falsch markiert ·
@@ -4148,7 +4175,7 @@ def page_churn_prediction():
         show_risk["Risiko"] = show_risk["Risiko"].map(lambda x: f"{x:.0%}")
         show_risk["Umsatz"] = show_risk["Umsatz"].map(lambda x: human_money(x))
         show_risk["Retouren"] = show_risk["Retouren"].map(lambda x: f"{x:.0%}")
-        st.dataframe(show_risk, use_container_width=True, hide_index=True, height=400)
+        st.dataframe(show_risk, width="stretch", hide_index=True, height=400)
         st.markdown("</div>", unsafe_allow_html=True)
         spacer()
 
@@ -4188,7 +4215,7 @@ def page_churn_prediction():
                               help="Standard: 0.5 · Für FN↓: 0.3–0.4 · Für FP↓: 0.6–0.7")
         spacer()
 
-        if st.button("🔮 Churn vorhersagen", use_container_width=True, type="primary"):
+        if st.button("🔮 Churn vorhersagen", width="stretch", type="primary"):
             raw = np.array([[v_orders, v_spend, v_aov, v_days, v_opm, v_rr, v_cats, v_brands, v_profit, v_age]])
             scaled = scaler.transform(raw)
             proba = best_model.predict_proba(scaled)[0]
@@ -4223,10 +4250,10 @@ def page_churn_prediction():
                                                                  "color": "rgba(244,63,94,0.15)"}]}))
                 fig_g.update_layout(height=250, margin=dict(l=20, r=20, t=50, b=10),
                                     paper_bgcolor="rgba(0,0,0,0)", font=dict(family="Inter, sans-serif"))
-                st.plotly_chart(fig_g, use_container_width=True)
+                st.plotly_chart(fig_g, width="stretch")
 
     else:
-        st.warning("Nicht genügend Daten oder keine Varianz in der Churn-Variable.")
+        st.warning(training_error)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4269,33 +4296,34 @@ def page_export():
         st.markdown('<div class="glass">', unsafe_allow_html=True)
         sec("Bestelldaten (Sales)", C["cyan"])
 
-        # CSV Export
-        csv_sales = cs.drop(columns=["_year", "_is_cs"]).to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Sales als CSV herunterladen",
-            data=csv_sales,
-            file_name="sales_export.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        # Generate large exports only when requested, never on page entry.
+        if st.button("Sales-CSV vorbereiten", key="prepare_sales_csv"):
+            with st.spinner("CSV wird vorbereitet..."):
+                csv_sales = cs.drop(columns=["_year", "_is_cs"]).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="📥 Sales als CSV herunterladen",
+                data=csv_sales,
+                file_name="sales_export.csv",
+                mime="text/csv",
+                on_click="ignore",
+                width="stretch",
+            )
 
         spacer()
 
-        # Excel Export
-        excel_buffer = BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            cs[["order_id", "product_name", "brand", "category", "department",
-                "sale_price", "product_cost", "profit", "status", "country",
-                "created_at"]].to_excel(writer, sheet_name="Sales", index=False)
-        excel_data = excel_buffer.getvalue()
+        if st.button("Sales-Excel vorbereiten", key="prepare_sales_excel"):
+            from export_runtime import build_sales_excel
 
-        st.download_button(
-            label="📥 Sales als Excel herunterladen",
-            data=excel_data,
-            file_name="sales_export.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+            with st.spinner("Excel wird vorbereitet..."):
+                excel_data = build_sales_excel(cs)
+            st.download_button(
+                label="📥 Sales als Excel herunterladen",
+                data=excel_data,
+                file_name="sales_export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                on_click="ignore",
+                width="stretch",
+            )
 
         spacer()
         mini("Zeilen", human_number(len(cs)), C["cyan"])
@@ -4322,7 +4350,7 @@ def page_export():
                      human_money(profit), pct(margin), pct(rr), human_number(cust)]
         })
 
-        st.dataframe(kpi_summary, use_container_width=True, hide_index=True)
+        st.dataframe(kpi_summary, width="stretch", hide_index=True)
 
         spacer()
 
@@ -4332,7 +4360,7 @@ def page_export():
             data=csv_kpi,
             file_name="kpi_summary.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -4348,13 +4376,13 @@ def page_export():
         # Top Kategorien
         cat_data = cs.groupby("category")["sale_price"].sum().reset_index().sort_values("sale_price", ascending=False)
         cat_csv = cat_data.to_csv(index=False).encode("utf-8")
-        st.download_button("📥 Kategorien-Umsatz (CSV)", cat_csv, "kategorien_umsatz.csv", "text/csv", use_container_width=True)
+        st.download_button("📥 Kategorien-Umsatz (CSV)", cat_csv, "kategorien_umsatz.csv", "text/csv", width="stretch")
 
     with c2:
         # Monthly data
         monthly_export = monthly[["Month", "Sales", "MoM"]].copy()
         mon_csv = monthly_export.to_csv(index=False).encode("utf-8")
-        st.download_button("📥 Monatsumsatz (CSV)", mon_csv, "monatsumsatz.csv", "text/csv", use_container_width=True)
+        st.download_button("📥 Monatsumsatz (CSV)", mon_csv, "monatsumsatz.csv", "text/csv", width="stretch")
 
     with c3:
         # Customer data
@@ -4364,7 +4392,7 @@ def page_export():
             Avg_Order=("sale_price", "mean")
         ).reset_index().sort_values("Total_Sales", ascending=False)
         cust_csv = cust_export.to_csv(index=False).encode("utf-8")
-        st.download_button("📥 Kundendaten (CSV)", cust_csv, "kundendaten.csv", "text/csv", use_container_width=True)
+        st.download_button("📥 Kundendaten (CSV)", cust_csv, "kundendaten.csv", "text/csv", width="stretch")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -4448,7 +4476,7 @@ def page_login():
         login_user = st.text_input("Benutzername", placeholder="Benutzername", key="login_user")
         login_pass = st.text_input("Passwort", type="password", placeholder="••••••••", key="login_pass")
 
-        if st.button("Anmelden →", use_container_width=True, type="primary"):
+        if st.button("Anmelden →", width="stretch", type="primary"):
             if login_user == VALID_USER and login_pass == VALID_PASS:
                 st.session_state.logged_in = True
                 st.session_state.login_user = login_user
@@ -4984,7 +5012,7 @@ def page_startseite():
                     placeholder="••••••••",
                     key="dv_login_pass",
                 )
-                submitted = st.form_submit_button("Anmelden →", use_container_width=True)
+                submitted = st.form_submit_button("Anmelden →", width="stretch")
 
                 if submitted:
                     if login_user == VALID_USER and login_pass == VALID_PASS:
@@ -5213,7 +5241,7 @@ def page_projekte():
     spacer()
 
     #  Button zum Dashboard öffnen 
-    if st.button("📊  Dashboard öffnen →", use_container_width=True, type="primary", key="open_project_btn"):
+    if st.button("📊  Dashboard öffnen →", width="stretch", type="primary", key="open_project_btn"):
         st.session_state.project_selected = True
         st.rerun()
 
@@ -5275,7 +5303,7 @@ def page_projekte():
     spacer()
 
     # Logout Button 
-    if st.button("🚪  Abmelden", use_container_width=False, type="secondary", key="logout_projekte"):
+    if st.button("🚪  Abmelden", width="content", type="secondary", key="logout_projekte"):
         st.session_state.logged_in = False
         st.session_state.project_selected = False
         st.session_state.pop("login_user", None)
@@ -5324,10 +5352,10 @@ if st.session_state.logged_in and st.session_state.project_selected:
             ✓ Angemeldet als <strong>{st.session_state.get('login_user', 'admin')}</strong>
         </span>
     </div>""", unsafe_allow_html=True)
-    if st.sidebar.button("📂  Zurück zu Projekte", use_container_width=True, type="secondary"):
+    if st.sidebar.button("📂  Zurück zu Projekte", width="stretch", type="secondary"):
         st.session_state.project_selected = False
         st.rerun()
-    if st.sidebar.button("🚪  Abmelden", use_container_width=True, type="secondary"):
+    if st.sidebar.button("🚪  Abmelden", width="stretch", type="secondary"):
         st.session_state.logged_in = False
         st.session_state.project_selected = False
         st.session_state.pop("login_user", None)
@@ -5350,7 +5378,9 @@ else:
     }
 
 pg = st.navigation(nav_pages)
+log_memory(f"page_start:{pg.url_path or 'home'}")
 pg.run()
+log_memory(f"page_end:{pg.url_path or 'home'}")
 
 # ╔═══════════════════════════════════════════════════════════╗
 #  FOOTER
