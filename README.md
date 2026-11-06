@@ -75,11 +75,30 @@ sslmode = "require"
 ```
 
 ### 4. Run locally
-```bash
-streamlit run DataVita.py
-```
-
 ---
+Clone the repository and install dependencies:
+
+  git clone https://github.com/Ramzis5/ecommerce-analytics.git
+  cd ecommerce-analytics
+  python -m pip install -r requirements.txt
+
+Create .streamlit/secrets.toml with your Supabase connection details:
+
+  [postgres]
+   user = "YOUR_DATABASE_USER"
+   password = "YOUR_DATABASE_PASSWORD"
+   host = "YOUR_DATABASE_HOST"
+   port = "6543"
+   database = "postgres"
+   sslmode = "require"
+
+Use the host, user and port from your Supabase connection settings. Keep secrets.toml out of Git.
+
+Start the app:
+
+    streamlit run DataVita.py
+
+Keep data_runtime.py, ml_reliability.py, export_runtime.py and runtime_diagnostics.py alongside DataVita.py.
 
 ## 📁 Project Structure
 
@@ -90,7 +109,6 @@ ecommerce-analytics/
 ├── ml_reliability.py         # Cache fingerprints and ML input guards
 ├── export_runtime.py         # Streaming Excel export
 ├── runtime_diagnostics.py    # Peak memory markers for Cloud logs
-├── tests/                    # Offline regression tests
 ├── requirements.txt          # Python dependencies
 ├── .gitignore               # Git ignore rules
 ├── .streamlit/
@@ -113,58 +131,18 @@ The app queries 5 PostgreSQL tables:
 
 Data source: **TheLook E-Commerce** dataset (100K+ records)
 
-## Cloud stability changes
-
-The customer funnel now fetches small SQL aggregates when its page is opened,
-instead of keeping the entire raw events table in every session. Distinct
-sessions are counted across all selected years; raw event counts retain their
-original meaning. The other sidebar filters still apply to sales/customers,
-while the event funnel uses the year filter, as before.
-
-Large sales CSV/Excel downloads have a **prepare** button. Excel is written
-row by row; timezone-aware dates are exported as UTC without a timezone,
-because Excel does not support timezone-aware datetime cells.
-
-Churn caches use complete input fingerprints, keep one entry, and expire.
-Random Forest training uses one worker. Forecasting retains at least six
-training months when the user changes the date range and test horizon.
-
-Deploy all Python modules together with `DataVita.py` and the updated
-`requirements.txt`; keep the Streamlit entrypoint set to `DataVita.py`.
-The README's former `[database]` example did not match the code: the app
-expects `[postgres]` in Streamlit Secrets. Existing working secrets need no change.
-
-Offline checks (no Supabase credentials needed):
-
-```bash
-python -m pip install -r requirements.txt pytest
-python -m pytest tests -q
-```
-
-Cloud logs include `[runtime] page_start`, `page_end`, and `peak_rss_mib`
-markers. The RSS value is the process high-water mark, not current usage.
-Use these alongside the platform logs at the time of a crash. The code
-contains real memory hotspots, but the generic “Error running app” page alone
-does not establish an out-of-memory failure; the live Cloud logs are still
-needed to confirm the production cause.
-
-The supplied Cloud log successfully downgraded PyArrow before startup and
-contained no actual crash traceback. Requirements now keep the same
-`pyarrow<25` compatibility cap explicitly. Native-fault logging is enabled
-where supported, and deprecated width arguments have been migrated to `width`.
-The offline suite also passes with the main dependency versions in that log
-(Streamlit 1.67.0, pandas 3.1.1 and PyArrow 24.0.0).
-
-Existing presentation metrics in the churn page include fixed model scores,
-SMOTE counts/status and customer totals. This stability change leaves those
-values unchanged; they should not be treated as freshly calculated evaluation
-results.
-
 ---
 
 ## 📸 Screenshots
 
-> _Add screenshots of your dashboard here_
+> <img width="1724" height="5074" alt="screencapture-ecommerce-analytics-1" src="https://github.com/user-attachments/assets/cd61eba9-ac62-4d05-ba0e-9672c5886689" />
+
+<img width="1366" height="599" alt="screencapture_ecommerce_analytics_2" src="https://github.com/user-attachments/assets/291a9042-7cda-419a-9b85-f8a86568e6ba" />
+
+<img width="1366" height="1297" alt="screencapture-ecommerce-analytics-3" src="https://github.com/user-attachments/assets/7fdc851c-95da-40b5-8e13-63bf7d13f62a" />
+
+<img width="1366" height="3246" alt="screencapture-ecommerce-analytics-7" src="https://github.com/user-attachments/assets/1d8c4fb7-705b-420e-9eff-94f1aab63a56" />
+<img width="1366" height="599" alt="screencapture_1793978462137" src="https://github.com/user-attachments/assets/cd02efbe-5ff9-4bfc-9b9b-ea5c040e74c9" />
 
 ---
 
